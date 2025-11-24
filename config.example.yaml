@@ -1,0 +1,9 @@
+# nvimvt configuration
+address: http://127.0.0.1:8200
+mount_point: secret
+auth_method: token
+# If auth_method is token, use this value; if k8s-secret, read from k8s_token_path when empty
+# token: s.xxxxxx
+k8s_token_path: /var/run/secrets/kubernetes.io/serviceaccount/token
+# username: dev
+# password: example

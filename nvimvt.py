@@ -6,13 +6,19 @@ from __future__ import annotations
 import curses
 import curses.textpad
 import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import hvac
+import yaml
 
 KEY_TAB = getattr(curses, "KEY_TAB", 9)
 KEY_BTAB = getattr(curses, "KEY_BTAB", 353)
+
+
+CONFIG_PATH = Path(os.environ.get("NVIMVT_CONFIG", Path.home() / ".config" / "nvimvt" / "config.yaml"))
 
 
 @dataclass
@@ -25,6 +31,34 @@ class FormField:
         if self.secret and self.value:
             return "*" * len(self.value)
         return self.value or "<empty>"
+
+
+@dataclass
+class AppConfig:
+    address: str = "http://127.0.0.1:8200"
+    mount_point: str = "secret"
+    auth_method: str = "token"
+    token: str = ""
+    username: str = ""
+    password: str = ""
+    k8s_token_path: str = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+    @classmethod
+    def load(cls) -> "AppConfig":
+        if CONFIG_PATH.exists():
+            try:
+                data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+                defaults = {field: getattr(cls(), field) for field in cls.__dataclass_fields__}
+                defaults.update(data)
+                return cls(**defaults)
+            except Exception:  # noqa: BLE001
+                pass
+        return cls()
+
+    def save(self) -> None:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(yaml.safe_dump(self.__dict__, sort_keys=False))
+        os.chmod(CONFIG_PATH, 0o600)
 
 
 class TextInput:
@@ -77,34 +111,48 @@ class MultiLineInput:
 
 class NvimvtApp:
     def __init__(self) -> None:
+        self.config = AppConfig.load()
         self.client: Optional[hvac.Client] = None
-        self.address = "http://127.0.0.1:8200"
-        self.mount_point = "secret"
+        self.address = self.config.address
+        self.mount_point = self.config.mount_point
         self.fields: List[FormField] = [
             FormField("Vault address", self.address),
             FormField("KV v2 mount", self.mount_point),
-            FormField("Auth: token/userpass", "token"),
-            FormField("Token", secret=True),
-            FormField("Username"),
-            FormField("Password", secret=True),
+            FormField("Auth: token/userpass/k8s-secret", self.config.auth_method),
+            FormField("Token", self.config.token, secret=True),
+            FormField("K8s token path", self.config.k8s_token_path, secret=True),
+            FormField("Username", self.config.username),
+            FormField("Password", self.config.password, secret=True),
         ]
         self.status_lines: List[str] = []
+        self.theme_ready = False
 
     # UI helpers
     def log(self, message: str) -> None:
         self.status_lines.append(message)
         self.status_lines = self.status_lines[-8:]
 
+    def init_colors(self) -> None:
+        if self.theme_ready:
+            return
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)  # accents
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)  # headers
+            curses.init_pair(3, curses.COLOR_GREEN, -1)  # success
+            curses.init_pair(4, curses.COLOR_RED, -1)  # errors
+        self.theme_ready = True
+
     def draw_header(self, stdscr: curses.window, title: str) -> None:
-        stdscr.clear()
         max_y, max_x = stdscr.getmaxyx()
-        stdscr.addstr(0, 2, f"nvimvt :: {title}")
+        stdscr.addstr(0, 2, f"nvimvt :: {title}", curses.color_pair(2) | curses.A_BOLD)
         stdscr.hline(1, 0, curses.ACS_HLINE, max_x)
 
     def draw_status(self, stdscr: curses.window) -> None:
         max_y, max_x = stdscr.getmaxyx()
         stdscr.hline(max_y - 9, 0, curses.ACS_HLINE, max_x)
-        stdscr.addstr(max_y - 9, 2, " Recent events ")
+        stdscr.addstr(max_y - 9, 2, " Recent events ", curses.color_pair(1) | curses.A_BOLD)
         for idx, line in enumerate(self.status_lines[-8:]):
             stdscr.addstr(max_y - 8 + idx, 2, line[: max_x - 4])
 
@@ -112,13 +160,15 @@ class NvimvtApp:
     def login_screen(self, stdscr: curses.window) -> None:
         current = 0
         while True:
+            stdscr.erase()
             self.draw_header(stdscr, "Vault configuration")
-            stdscr.addstr(2, 2, "Tab: next field • Enter: edit • F5: connect")
+            stdscr.addstr(2, 2, "Tab: next field • Enter: edit • F2: save cfg • F5: connect")
             for idx, field in enumerate(self.fields):
                 prefix = "→ " if idx == current else "  "
                 stdscr.addstr(4 + idx, 2, f"{prefix}{field.label}: {field.display_value()}")
             self.draw_status(stdscr)
-            stdscr.refresh()
+            stdscr.noutrefresh()
+            curses.doupdate()
 
             key = stdscr.getch()
             if key in (KEY_TAB, 9):
@@ -134,8 +184,10 @@ class NvimvtApp:
                     height=3,
                 )
                 selected.value = editor.capture()
-                if selected.label == "Auth: token/userpass":
+                if selected.label == "Auth: token/userpass/k8s-secret":
                     selected.value = selected.value.lower().strip() or "token"
+            elif key == curses.KEY_F2:
+                self.persist_form(save=True)
             elif key == curses.KEY_F5:
                 if self.try_authenticate():
                     return
@@ -147,8 +199,9 @@ class NvimvtApp:
         mount = self.fields[1].value or self.mount_point
         method = self.fields[2].value.lower() or "token"
         token = self.fields[3].value
-        username = self.fields[4].value
-        password = self.fields[5].value
+        k8s_token_path = self.fields[4].value or self.config.k8s_token_path
+        username = self.fields[5].value
+        password = self.fields[6].value
 
         client = hvac.Client(url=address)
         try:
@@ -157,15 +210,24 @@ class NvimvtApp:
                     self.log("Token required for token auth")
                     return False
                 client.token = token
+            elif method == "k8s-secret":
+                path = Path(k8s_token_path)
+                if not token:
+                    if not path.exists():
+                        self.log(f"No token at {path}")
+                        return False
+                    token = path.read_text().strip()
+                client.token = token
             elif method == "userpass":
                 client.auth.userpass.login(username=username, password=password)
             else:
-                self.log("Auth method must be token or userpass")
+                self.log("Auth method must be token, userpass, or k8s-secret")
                 return False
             if client.is_authenticated():
                 self.client = client
                 self.address = address
                 self.mount_point = mount
+                self.persist_form(save=True)
                 self.log(f"Connected to {address} (mount: {mount})")
                 return True
             self.log("Authentication failed")
@@ -174,17 +236,32 @@ class NvimvtApp:
             self.log(f"Auth error: {exc}")
             return False
 
+    def persist_form(self, save: bool = False) -> None:
+        self.config.address = self.fields[0].value or self.address
+        self.config.mount_point = self.fields[1].value or self.mount_point
+        self.config.auth_method = self.fields[2].value or "token"
+        self.config.token = self.fields[3].value
+        self.config.k8s_token_path = self.fields[4].value or self.config.k8s_token_path
+        self.config.username = self.fields[5].value
+        self.config.password = self.fields[6].value
+        if save:
+            self.config.save()
+            self.log(f"Saved config to {CONFIG_PATH}")
+
     # Main dashboard
     def dashboard(self, stdscr: curses.window) -> None:
         while True:
+            stdscr.erase()
             self.draw_header(stdscr, f"Vault: {self.address} • mount: {self.mount_point}")
             stdscr.addstr(
                 2,
                 2,
                 "[L]ist [R]ead [W]rite [D]elete [M]ount change [G]auth [Q]uit",
+                curses.color_pair(1) | curses.A_BOLD,
             )
             self.draw_status(stdscr)
-            stdscr.refresh()
+            stdscr.noutrefresh()
+            curses.doupdate()
 
             key = stdscr.getch()
             if key in (ord("l"), ord("L")):
@@ -312,8 +389,11 @@ class NvimvtApp:
         win.getch()
 
     def run(self, stdscr: curses.window) -> None:
+        self.init_colors()
         curses.curs_set(0)
         stdscr.nodelay(False)
+        if curses.has_colors():
+            stdscr.bkgd(" ", curses.color_pair(0))
         try:
             self.login_screen(stdscr)
             self.dashboard(stdscr)
