@@ -9,7 +9,7 @@ A curses-based terminal UI for HashiCorp Vault secrets. It focuses on developers
 
 ## Requirements
 - Python 3.10+
-- `hvac` library (install with `pip install -r requirements.txt`).
+- `hvac` library pinned to 2.4.0 (install with `pip install -r requirements.txt`).
 - Access to a Vault instance with KV v2 enabled on the chosen mount (defaults to `secret`).
 
 ## Usage

@@ -11,6 +11,9 @@ from typing import Dict, List, Optional
 
 import hvac
 
+KEY_TAB = getattr(curses, "KEY_TAB", 9)
+KEY_BTAB = getattr(curses, "KEY_BTAB", 353)
+
 
 @dataclass
 class FormField:
@@ -118,9 +121,9 @@ class NvimvtApp:
             stdscr.refresh()
 
             key = stdscr.getch()
-            if key in (curses.KEY_TAB, 9):
+            if key in (KEY_TAB, 9):
                 current = (current + 1) % len(self.fields)
-            elif key in (curses.KEY_BTAB, ):  # Shift+Tab
+            elif key in (KEY_BTAB,):  # Shift+Tab
                 current = (current - 1) % len(self.fields)
             elif key in (curses.KEY_ENTER, 10, 13):
                 selected = self.fields[current]
