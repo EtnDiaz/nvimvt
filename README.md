@@ -1,46 +1,48 @@
 # nvimvt
 
-A curses-based terminal UI for HashiCorp Vault secrets. It focuses on developers who can port-forward to Vault but cannot reach it via Tailscale.
+A k9s-inspired curses UI for exploring HashiCorp Vault KV v2 secrets. Designed for developers who port-forward to Vault but need a fast terminal explorer to browse, read, version, and edit secrets.
 
 ## Features
-- Login with Vault **token**, **userpass**, or **k8s-secret** (read a token from a mounted Kubernetes secret file).
-- Config-driven startup that remembers your last session (address, mount, auth method, token paths) in `~/.config/nvimvt/config.yaml`.
-- Full-screen TUI with low-flicker redraws, color-coded headers, and a k9s-inspired hotkey dashboard.
-- Work with KV v2 secrets: list keys, read a version, create or update (new version), and delete versions or entire metadata.
+- **Full-screen explorer**: tree navigation for KV v2 paths with live detail pane and version metadata.
+- **Auth options**: token, userpass, or Kubernetes service-account token (from a mounted secret file).
+- **Config-backed startup**: remembers address, mount, and auth fields in `~/.config/nvimvt/config.yaml` (or `$NVIMVT_CONFIG`).
+- **Low-flicker rendering**: uses `noutrefresh`/`doupdate` and a subdued color theme for comfortable daily use.
 
 ## Requirements
 - Python 3.10+
-- `pip install -r requirements.txt` (installs `hvac==2.4.0` and `PyYAML`).
-- Access to a Vault instance with KV v2 enabled on the chosen mount (defaults to `secret`).
+- `pip install -r requirements.txt` (installs `hvac==2.4.0` and `PyYAML`)
+- Access to a Vault instance with a KV v2 mount (defaults to `secret`)
 
-## Run
+## Running
 ```bash
 pip install -r requirements.txt
 python nvimvt.py
 ```
 
-### Login screen
-- Use **Tab/Shift+Tab** to move between fields and **Enter** to edit a field.
-- Press **F5** to connect with the selected auth method.
-- Press **F2** to save the current form to `~/.config/nvimvt/config.yaml` (created with `0600` permissions).
+## Login
+- Tab/Shift+Tab to move, Enter to edit a field.
+- F5 authenticates with the selected method; F2 saves the form to `~/.config/nvimvt/config.yaml` (0600 permissions).
+- Auth methods:
+  - `token`: direct Vault token.
+  - `userpass`: username/password.
+  - `k8s-secret`: read a JWT from `k8s_token_path` (defaults to the Kubernetes service account token file) and log in via the Kubernetes auth method.
 
-Supported auth methods:
-- `token`: connect with the provided Vault token.
-- `userpass`: connect with username/password on the configured mount.
-- `k8s-secret`: use the provided token, or read one from `k8s_token_path` (defaults to `/var/run/secrets/kubernetes.io/serviceaccount/token`).
+## Explorer
+Hotkeys:
+- **Enter**: open folder / refresh selected secret
+- **↑/↓** or **j/k**: move selection
+- **b**: go up one folder
+- **r**: reload current folder
+- **n**: create a secret (prompts for name and JSON payload)
+- **e**: edit selected secret (writes a new version)
+- **d**: delete selected secret (metadata + all versions)
+- **v**: toggle version list display for the selected secret
+- **q**: quit
 
-### Dashboard
-Hotkeys mirror the minimal k9s-style palette:
-- `L` list a path
-- `R` read a secret (optionally choose a version)
-- `W` create/update using multi-line `key=value` pairs
-- `D` delete (soft delete or destroy all versions)
-- `M` change the KV v2 mount point
-- `G` reopen the login form and re-authenticate
-- `Q` quit
+The left pane lists folders (ending with `/`) and secrets. The right pane shows the selected secret's JSON payload plus version metadata and, when toggled, a list of available versions.
 
-### Config file
-A sample config is provided in `config.example.yaml`:
+## Config file
+Example `config.example.yaml`:
 ```yaml
 address: http://127.0.0.1:8200
 mount_point: secret
@@ -51,8 +53,9 @@ k8s_token_path: /var/run/secrets/kubernetes.io/serviceaccount/token
 # password: example
 ```
 
-Copy it to `~/.config/nvimvt/config.yaml` (or point `NVIMVT_CONFIG` to another path) to pre-seed defaults before launching. Secrets are not encrypted; store only development tokens.
+Copy the file to `~/.config/nvimvt/config.yaml` (or point `NVIMVT_CONFIG` elsewhere) to pre-fill defaults.
 
 ## Notes
-- The app assumes a KV v2 mount point; update the mount prompt to match your Vault.
-- Errors from Vault are reported inline so you can adjust paths or permissions quickly.
+- The UI assumes KV v2; update `mount_point` if your mount differs.
+- Secrets are edited as JSON objects; non-object payloads are rejected for safety.
+- Kubernetes auth uses the `default` role. Adjust Vault policies/roles as needed for your cluster.

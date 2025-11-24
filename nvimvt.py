@@ -1,9 +1,11 @@
-"""
-Curses-based TUI for managing HashiCorp Vault KV v2 secrets.
-"""
 from __future__ import annotations
 
+"""
+Nvimvt: curses-based Vault KV explorer with theme and config support.
+"""
+
 import curses
+import curses.panel
 import curses.textpad
 import json
 import os
@@ -17,27 +19,16 @@ import yaml
 KEY_TAB = getattr(curses, "KEY_TAB", 9)
 KEY_BTAB = getattr(curses, "KEY_BTAB", 353)
 
-
-CONFIG_PATH = Path(os.environ.get("NVIMVT_CONFIG", Path.home() / ".config" / "nvimvt" / "config.yaml"))
-
-
-@dataclass
-class FormField:
-    label: str
-    value: str = ""
-    secret: bool = False
-
-    def display_value(self) -> str:
-        if self.secret and self.value:
-            return "*" * len(self.value)
-        return self.value or "<empty>"
+CONFIG_PATH = Path(
+    os.environ.get("NVIMVT_CONFIG", Path.home() / ".config" / "nvimvt" / "config.yaml")
+)
 
 
 @dataclass
 class AppConfig:
     address: str = "http://127.0.0.1:8200"
     mount_point: str = "secret"
-    auth_method: str = "token"
+    auth_method: str = "token"  # token|userpass|k8s-secret
     token: str = ""
     username: str = ""
     password: str = ""
@@ -48,11 +39,11 @@ class AppConfig:
         if CONFIG_PATH.exists():
             try:
                 data = yaml.safe_load(CONFIG_PATH.read_text()) or {}
-                defaults = {field: getattr(cls(), field) for field in cls.__dataclass_fields__}
-                defaults.update(data)
+                defaults = {f: getattr(cls(), f) for f in cls.__dataclass_fields__}
+                defaults.update({k: v for k, v in data.items() if k in defaults})
                 return cls(**defaults)
             except Exception:  # noqa: BLE001
-                pass
+                return cls()
         return cls()
 
     def save(self) -> None:
@@ -61,348 +52,404 @@ class AppConfig:
         os.chmod(CONFIG_PATH, 0o600)
 
 
-class TextInput:
-    def __init__(self, stdscr: curses.window, title: str, initial: str = "", height: int = 3):
-        self.stdscr = stdscr
-        self.title = title
+class VaultClient:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.client: Optional[hvac.Client] = None
+
+    def connect(self) -> None:
+        self.client = hvac.Client(url=self.cfg.address)
+        if not self.client.is_authenticated():
+            self._login()
+
+    def _login(self) -> None:
+        if self.cfg.auth_method == "token":
+            if not self.cfg.token:
+                raise ValueError("Token is required for token auth")
+            self.client.token = self.cfg.token
+        elif self.cfg.auth_method == "userpass":
+            if not (self.cfg.username and self.cfg.password):
+                raise ValueError("Username/password required for userpass auth")
+            self.client.auth.userpass.login(self.cfg.username, self.cfg.password)
+        elif self.cfg.auth_method == "k8s-secret":
+            token_path = Path(self.cfg.k8s_token_path)
+            if not token_path.exists():
+                raise ValueError(f"Kubernetes token not found at {token_path}")
+            jwt = token_path.read_text().strip()
+            self.client.auth.kubernetes.login(role="default", jwt=jwt)
+        else:
+            raise ValueError(f"Unsupported auth method: {self.cfg.auth_method}")
+        if not self.client.is_authenticated():
+            raise RuntimeError("Authentication failed")
+
+    # KV helpers
+    def list_keys(self, path: str) -> List[str]:
+        api = self.client.secrets.kv.v2
+        full_path = path.rstrip("/")
+        try:
+            resp = api.list_secrets(path=full_path, mount_point=self.cfg.mount_point)
+            return sorted(resp["data"].get("keys", []))
+        except hvac.exceptions.InvalidPath:
+            return []
+
+    def read_secret(self, path: str, version: Optional[int] = None) -> Dict:
+        api = self.client.secrets.kv.v2
+        resp = api.read_secret_version(
+            path=path.rstrip("/"), version=version, mount_point=self.cfg.mount_point
+        )
+        return resp["data"]
+
+    def read_metadata(self, path: str) -> Dict:
+        api = self.client.secrets.kv.v2
+        resp = api.read_metadata(path=path.rstrip("/"), mount_point=self.cfg.mount_point)
+        return resp["data"]
+
+    def write_secret(self, path: str, payload: Dict) -> None:
+        api = self.client.secrets.kv.v2
+        api.create_or_update_secret(
+            path=path.rstrip("/"), secret=payload, mount_point=self.cfg.mount_point
+        )
+
+    def delete_secret(self, path: str) -> None:
+        api = self.client.secrets.kv.v2
+        api.delete_metadata_and_all_versions(path=path.rstrip("/"), mount_point=self.cfg.mount_point)
+
+
+class Modal:
+    def __init__(self, stdscr: curses.window, title: str, height: int, width: int):
+        max_y, max_x = stdscr.getmaxyx()
+        top = max((max_y - height) // 2, 1)
+        left = max((max_x - width) // 2, 2)
+        self.win = curses.newwin(height, width, top, left)
+        self.win.keypad(True)
+        self.win.border()
+        self.win.addstr(0, 2, f" {title} ")
+
+    def refresh(self) -> None:
+        self.win.noutrefresh()
+
+
+class LineInput(Modal):
+    def __init__(self, stdscr: curses.window, title: str, initial: str = ""):
+        super().__init__(stdscr, title, height=5, width=max(40, len(initial) + 10))
         self.initial = initial
-        self.height = height
 
     def capture(self) -> str:
-        max_y, max_x = self.stdscr.getmaxyx()
-        width = max_x - 4
-        start_y = max_y // 2 - self.height // 2
-        start_x = 2
-        win = curses.newwin(self.height, width, start_y, start_x)
-        win.border()
-        win.addstr(0, 2, f" {self.title} ")
-        win.addstr(1, 2, self.initial)
+        self.win.addstr(2, 2, self.initial)
+        box = curses.textpad.Textbox(self.win.derwin(1, self.win.getmaxyx()[1] - 4, 2, 2))
         curses.curs_set(1)
-        textbox = curses.textpad.Textbox(win.derwin(1, width - 4, 1, 2))
-        textbox.stripspaces = True
-        result = textbox.edit().strip()
+        text = box.edit().strip()
         curses.curs_set(0)
-        return result or self.initial
+        return text or self.initial
 
 
-class MultiLineInput:
-    def __init__(self, stdscr: curses.window, title: str, initial: str = "", height: int = 10):
-        self.stdscr = stdscr
-        self.title = title
+class MultiLineEditor(Modal):
+    def __init__(self, stdscr: curses.window, title: str, initial: str = ""):
+        super().__init__(stdscr, title, height=15, width=80)
         self.initial = initial
-        self.height = height
 
     def capture(self) -> str:
-        max_y, max_x = self.stdscr.getmaxyx()
-        width = max_x - 4
-        start_y = max_y // 2 - self.height // 2
-        start_x = 2
-        win = curses.newwin(self.height, width, start_y, start_x)
-        win.border()
-        win.addstr(0, 2, f" {self.title} (Ctrl+G to submit) ")
-        for idx, line in enumerate(self.initial.splitlines()):
-            win.addstr(1 + idx, 2, line)
+        lines = self.initial.splitlines()
+        for idx, line in enumerate(lines[: self.win.getmaxyx()[0] - 3]):
+            self.win.addstr(1 + idx, 2, line[: self.win.getmaxyx()[1] - 4])
+        edit_win = self.win.derwin(self.win.getmaxyx()[0] - 2, self.win.getmaxyx()[1] - 4, 1, 2)
+        editor = curses.textpad.Textbox(edit_win)
         curses.curs_set(1)
-        textbox = curses.textpad.Textbox(win.derwin(self.height - 2, width - 4, 1, 2))
-        content = textbox.edit().strip()
+        content = editor.edit().strip()
         curses.curs_set(0)
         return content or self.initial
 
 
-class NvimvtApp:
+class TuiApp:
     def __init__(self) -> None:
-        self.config = AppConfig.load()
-        self.client: Optional[hvac.Client] = None
-        self.address = self.config.address
-        self.mount_point = self.config.mount_point
-        self.fields: List[FormField] = [
-            FormField("Vault address", self.address),
-            FormField("KV v2 mount", self.mount_point),
-            FormField("Auth: token/userpass/k8s-secret", self.config.auth_method),
-            FormField("Token", self.config.token, secret=True),
-            FormField("K8s token path", self.config.k8s_token_path, secret=True),
-            FormField("Username", self.config.username),
-            FormField("Password", self.config.password, secret=True),
-        ]
-        self.status_lines: List[str] = []
-        self.theme_ready = False
+        self.cfg = AppConfig.load()
+        self.vault = VaultClient(self.cfg)
+        self.status: List[str] = []
+        self.current_path: str = ""
+        self.items: List[str] = []
+        self.selected: int = 0
+        self.show_versions: bool = False
+        self.colors_ready = False
 
-    # UI helpers
-    def log(self, message: str) -> None:
-        self.status_lines.append(message)
-        self.status_lines = self.status_lines[-8:]
-
+    # Color/theme
     def init_colors(self) -> None:
-        if self.theme_ready:
+        if self.colors_ready:
             return
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_CYAN, -1)  # accents
-            curses.init_pair(2, curses.COLOR_YELLOW, -1)  # headers
-            curses.init_pair(3, curses.COLOR_GREEN, -1)  # success
-            curses.init_pair(4, curses.COLOR_RED, -1)  # errors
-        self.theme_ready = True
+            curses.init_pair(1, curses.COLOR_CYAN, -1)  # accent
+            curses.init_pair(2, curses.COLOR_MAGENTA, -1)  # header
+            curses.init_pair(3, curses.COLOR_YELLOW, -1)  # highlight
+            curses.init_pair(4, curses.COLOR_GREEN, -1)  # success
+            curses.init_pair(5, curses.COLOR_RED, -1)  # errors
+        self.colors_ready = True
 
-    def draw_header(self, stdscr: curses.window, title: str) -> None:
-        max_y, max_x = stdscr.getmaxyx()
-        stdscr.addstr(0, 2, f"nvimvt :: {title}", curses.color_pair(2) | curses.A_BOLD)
-        stdscr.hline(1, 0, curses.ACS_HLINE, max_x)
+    def log(self, message: str, level: str = "info") -> None:
+        prefix = {
+            "info": "●",
+            "ok": "✓",
+            "err": "!",
+        }.get(level, "●")
+        self.status.append(f"{prefix} {message}")
+        self.status = self.status[-5:]
 
-    def draw_status(self, stdscr: curses.window) -> None:
-        max_y, max_x = stdscr.getmaxyx()
-        stdscr.hline(max_y - 9, 0, curses.ACS_HLINE, max_x)
-        stdscr.addstr(max_y - 9, 2, " Recent events ", curses.color_pair(1) | curses.A_BOLD)
-        for idx, line in enumerate(self.status_lines[-8:]):
-            stdscr.addstr(max_y - 8 + idx, 2, line[: max_x - 4])
+    # Screens
+    def run(self, stdscr: curses.window) -> None:
+        curses.curs_set(0)
+        stdscr.nodelay(False)
+        stdscr.keypad(True)
+        self.init_colors()
+        self.login_screen(stdscr)
+        self.explorer(stdscr)
 
-    # Login and configuration
     def login_screen(self, stdscr: curses.window) -> None:
-        current = 0
+        fields = [
+            ["Vault address", self.cfg.address, False],
+            ["KV mount", self.cfg.mount_point, False],
+            ["Auth (token/userpass/k8s-secret)", self.cfg.auth_method, False],
+            ["Token", self.cfg.token, True],
+            ["Username", self.cfg.username, False],
+            ["Password", self.cfg.password, True],
+            ["K8s token path", self.cfg.k8s_token_path, True],
+        ]
+        idx = 0
         while True:
             stdscr.erase()
-            self.draw_header(stdscr, "Vault configuration")
-            stdscr.addstr(2, 2, "Tab: next field • Enter: edit • F2: save cfg • F5: connect")
-            for idx, field in enumerate(self.fields):
-                prefix = "→ " if idx == current else "  "
-                stdscr.addstr(4 + idx, 2, f"{prefix}{field.label}: {field.display_value()}")
+            self.draw_header(stdscr, "Vault login")
+            hints = "Tab/Shift+Tab navigate • Enter edit • F2 save config • F5 connect • q quit"
+            stdscr.addstr(2, 2, hints, curses.color_pair(1))
+            for i, (label, value, secret) in enumerate(fields):
+                marker = "➤" if i == idx else " "
+                display = "*" * len(value) if secret and value else (value or "<empty>")
+                stdscr.addstr(4 + i, 4, f"{marker} {label:<32}: {display}")
             self.draw_status(stdscr)
             stdscr.noutrefresh()
             curses.doupdate()
 
             key = stdscr.getch()
             if key in (KEY_TAB, 9):
-                current = (current + 1) % len(self.fields)
-            elif key in (KEY_BTAB,):  # Shift+Tab
-                current = (current - 1) % len(self.fields)
+                idx = (idx + 1) % len(fields)
+            elif key == KEY_BTAB:
+                idx = (idx - 1) % len(fields)
             elif key in (curses.KEY_ENTER, 10, 13):
-                selected = self.fields[current]
-                editor = TextInput(
-                    stdscr,
-                    selected.label,
-                    initial=selected.value,
-                    height=3,
-                )
-                selected.value = editor.capture()
-                if selected.label == "Auth: token/userpass/k8s-secret":
-                    selected.value = selected.value.lower().strip() or "token"
+                title, current, secret = fields[idx]
+                editor = LineInput(stdscr, title, current)
+                new_val = editor.capture()
+                fields[idx][1] = new_val
             elif key == curses.KEY_F2:
-                self.persist_form(save=True)
+                self.cfg.address = fields[0][1].strip()
+                self.cfg.mount_point = fields[1][1].strip()
+                self.cfg.auth_method = fields[2][1].strip().lower() or "token"
+                self.cfg.token = fields[3][1].strip()
+                self.cfg.username = fields[4][1].strip()
+                self.cfg.password = fields[5][1].strip()
+                self.cfg.k8s_token_path = fields[6][1].strip()
+                self.cfg.save()
+                self.log(f"Config saved to {CONFIG_PATH}", "ok")
             elif key == curses.KEY_F5:
-                if self.try_authenticate():
+                self.cfg.address = fields[0][1].strip()
+                self.cfg.mount_point = fields[1][1].strip()
+                self.cfg.auth_method = fields[2][1].strip().lower() or "token"
+                self.cfg.token = fields[3][1].strip()
+                self.cfg.username = fields[4][1].strip()
+                self.cfg.password = fields[5][1].strip()
+                self.cfg.k8s_token_path = fields[6][1].strip()
+                try:
+                    self.vault = VaultClient(self.cfg)
+                    self.vault.connect()
+                    self.log("Authenticated", "ok")
+                    self.refresh_listing()
                     return
+                except Exception as exc:  # noqa: BLE001
+                    self.log(str(exc), "err")
             elif key in (ord("q"), 27):
                 raise KeyboardInterrupt
 
-    def try_authenticate(self) -> bool:
-        address = self.fields[0].value or self.address
-        mount = self.fields[1].value or self.mount_point
-        method = self.fields[2].value.lower() or "token"
-        token = self.fields[3].value
-        k8s_token_path = self.fields[4].value or self.config.k8s_token_path
-        username = self.fields[5].value
-        password = self.fields[6].value
-
-        client = hvac.Client(url=address)
-        try:
-            if method == "token":
-                if not token:
-                    self.log("Token required for token auth")
-                    return False
-                client.token = token
-            elif method == "k8s-secret":
-                path = Path(k8s_token_path)
-                if not token:
-                    if not path.exists():
-                        self.log(f"No token at {path}")
-                        return False
-                    token = path.read_text().strip()
-                client.token = token
-            elif method == "userpass":
-                client.auth.userpass.login(username=username, password=password)
-            else:
-                self.log("Auth method must be token, userpass, or k8s-secret")
-                return False
-            if client.is_authenticated():
-                self.client = client
-                self.address = address
-                self.mount_point = mount
-                self.persist_form(save=True)
-                self.log(f"Connected to {address} (mount: {mount})")
-                return True
-            self.log("Authentication failed")
-            return False
-        except Exception as exc:  # noqa: BLE001
-            self.log(f"Auth error: {exc}")
-            return False
-
-    def persist_form(self, save: bool = False) -> None:
-        self.config.address = self.fields[0].value or self.address
-        self.config.mount_point = self.fields[1].value or self.mount_point
-        self.config.auth_method = self.fields[2].value or "token"
-        self.config.token = self.fields[3].value
-        self.config.k8s_token_path = self.fields[4].value or self.config.k8s_token_path
-        self.config.username = self.fields[5].value
-        self.config.password = self.fields[6].value
-        if save:
-            self.config.save()
-            self.log(f"Saved config to {CONFIG_PATH}")
-
-    # Main dashboard
-    def dashboard(self, stdscr: curses.window) -> None:
+    def explorer(self, stdscr: curses.window) -> None:
         while True:
             stdscr.erase()
-            self.draw_header(stdscr, f"Vault: {self.address} • mount: {self.mount_point}")
-            stdscr.addstr(
-                2,
-                2,
-                "[L]ist [R]ead [W]rite [D]elete [M]ount change [G]auth [Q]uit",
-                curses.color_pair(1) | curses.A_BOLD,
-            )
+            self.draw_header(stdscr, f"Mount: {self.cfg.mount_point} :: {self.current_path or '/'}")
+            max_y, max_x = stdscr.getmaxyx()
+            sidebar_w = max(32, max_x // 3)
+            body_w = max_x - sidebar_w - 1
+            body_h = max_y - 5
+
+            sidebar = curses.newwin(body_h, sidebar_w, 2, 0)
+            details = curses.newwin(body_h, body_w, 2, sidebar_w + 1)
+            sidebar.keypad(True)
+
+            self.draw_sidebar(sidebar)
+            self.draw_details(details)
             self.draw_status(stdscr)
+
+            sidebar.noutrefresh()
+            details.noutrefresh()
             stdscr.noutrefresh()
             curses.doupdate()
 
             key = stdscr.getch()
-            if key in (ord("l"), ord("L")):
-                self.list_secrets(stdscr)
-            elif key in (ord("r"), ord("R")):
-                self.read_secret(stdscr)
-            elif key in (ord("w"), ord("W")):
-                self.write_secret(stdscr)
-            elif key in (ord("d"), ord("D")):
+            if key in (curses.KEY_UP, ord("k")):
+                self.selected = max(0, self.selected - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.selected = min(len(self.items) - 1, self.selected + 1)
+            elif key in (curses.KEY_ENTER, 10, 13):
+                self.enter_item()
+            elif key == ord("b"):
+                self.go_up()
+            elif key == ord("r"):
+                self.refresh_listing()
+            elif key == ord("n"):
+                self.create_secret(stdscr)
+            elif key == ord("e"):
+                self.edit_secret(stdscr)
+            elif key == ord("d"):
                 self.delete_secret(stdscr)
-            elif key in (ord("m"), ord("M")):
-                self.change_mount(stdscr)
-            elif key in (ord("g"), ord("G")):
-                self.login_screen(stdscr)
-            elif key in (ord("q"), ord("Q")):
-                break
+            elif key == ord("v"):
+                self.show_versions = not self.show_versions
+            elif key in (ord("q"), 27):
+                return
 
-    # Operations
-    def list_secrets(self, stdscr: curses.window) -> None:
-        path = TextInput(stdscr, "List path (relative)", "").capture()
-        try:
-            response = self.client.secrets.kv.v2.list_secrets(
-                path=path, mount_point=self.mount_point
-            )
-            keys = response["data"].get("keys", [])
-            if keys:
-                listing = ", ".join(keys)
-                self.log(f"Contents of {path or '/'}: {listing}")
-            else:
-                self.log(f"No secrets under {path or '/'}")
-        except hvac.exceptions.InvalidPath:
-            self.log("Invalid path for listing")
-        except Exception as exc:  # noqa: BLE001
-            self.log(f"List error: {exc}")
+    # Drawing
+    def draw_header(self, stdscr: curses.window, title: str) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        stdscr.addstr(0, 2, f"nvimvt :: {title}", curses.color_pair(2) | curses.A_BOLD)
+        stdscr.hline(1, 0, curses.ACS_HLINE, max_x)
 
-    def read_secret(self, stdscr: curses.window) -> None:
-        path = TextInput(stdscr, "Read path", "").capture()
-        version_text = TextInput(stdscr, "Version (blank = latest)", "").capture()
-        version = int(version_text) if version_text else None
-        try:
-            response = self.client.secrets.kv.v2.read_secret_version(
-                path=path, version=version, mount_point=self.mount_point
-            )
-            data = response["data"]["data"]
-            metadata = response["data"].get("metadata", {})
-            formatted = json.dumps({"data": data, "metadata": metadata}, indent=2)
-            self.display_output(stdscr, "Secret", formatted)
-            self.log(f"Read {path}")
-        except hvac.exceptions.InvalidPath:
-            self.log("Secret not found")
-        except Exception as exc:  # noqa: BLE001
-            self.log(f"Read error: {exc}")
+    def draw_sidebar(self, win: curses.window) -> None:
+        win.erase()
+        win.border()
+        win.addstr(0, 2, " Paths (Enter/open, b/up, n/new, d/delete) ", curses.color_pair(1))
+        for idx, item in enumerate(self.items):
+            marker = "➤" if idx == self.selected else " "
+            display = item
+            if display.endswith("/"):
+                display = f"{display}"
+            style = curses.A_BOLD if display.endswith("/") else curses.A_NORMAL
+            if idx == self.selected:
+                style |= curses.color_pair(3)
+            win.addstr(1 + idx, 2, f"{marker} {display}", style)
 
-    def write_secret(self, stdscr: curses.window) -> None:
-        path = TextInput(stdscr, "Write path", "").capture()
-        template = ""
-        editor = MultiLineInput(
-            stdscr,
-            "key=value per line (Ctrl+G to save)",
-            initial=template,
-            height=8,
-        )
-        raw = editor.capture()
-        data: Dict[str, str] = {}
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            if "=" not in line:
-                self.log(f"Skipping line without '=': {line}")
-                continue
-            key, value = line.split("=", 1)
-            data[key.strip()] = value.strip()
-        if not data:
-            self.log("No data provided; aborting write")
+    def draw_details(self, win: curses.window) -> None:
+        win.erase()
+        win.border()
+        win.addstr(0, 2, " Secret details (e edit, v versions) ", curses.color_pair(1))
+        if not self.items:
+            win.addstr(2, 2, "No items. Press n to create a secret.")
+            return
+        current = self.items[self.selected]
+        if current.endswith("/"):
+            win.addstr(2, 2, "Folder. Enter to open.")
             return
         try:
-            response = self.client.secrets.kv.v2.create_or_update_secret(
-                path=path, secret=data, mount_point=self.mount_point
-            )
-            version = response.get("data", {}).get("version")
-            self.log(f"Stored {path} (version {version})")
+            secret = self.vault.read_secret(self.current_path + current)
+            data = secret.get("data", {})
+            meta = secret.get("metadata", {})
+            lines = json.dumps(data, indent=2).splitlines()
+            for idx, line in enumerate(lines[: win.getmaxyx()[0] - 4]):
+                win.addstr(2 + idx, 2, line[: win.getmaxyx()[1] - 4])
+            win.addstr(win.getmaxyx()[0] - 3, 2, f"Version: {meta.get('version')} • Created: {meta.get('created_time')}")
+            if self.show_versions:
+                meta_info = self.vault.read_metadata(self.current_path + current)
+                win.addstr(win.getmaxyx()[0] - 2, 2, f"Versions: {sorted(meta_info.get('versions', {}).keys())}")
         except Exception as exc:  # noqa: BLE001
-            self.log(f"Write error: {exc}")
+            win.addstr(2, 2, f"Error: {exc}", curses.color_pair(5))
+
+    def draw_status(self, stdscr: curses.window) -> None:
+        max_y, max_x = stdscr.getmaxyx()
+        y = max_y - 3
+        stdscr.hline(y, 0, curses.ACS_HLINE, max_x)
+        stdscr.addstr(y, 2, " Status (r reload, e edit, n new, d delete, v versions, q quit) ", curses.color_pair(1))
+        for idx, line in enumerate(reversed(self.status)):
+            stdscr.addstr(y + 1 + idx, 2, line[: max_x - 4])
+
+    # Actions
+    def refresh_listing(self) -> None:
+        self.items = self.vault.list_keys(self.current_path)
+        self.selected = 0
+
+    def enter_item(self) -> None:
+        if not self.items:
+            return
+        item = self.items[self.selected]
+        if item.endswith("/"):
+            self.current_path += item
+            self.refresh_listing()
+        else:
+            # open detail - already showing
+            pass
+
+    def go_up(self) -> None:
+        if not self.current_path:
+            return
+        parts = self.current_path.rstrip("/").split("/")[:-1]
+        self.current_path = "/".join(parts)
+        if self.current_path:
+            self.current_path += "/"
+        self.refresh_listing()
+
+    def create_secret(self, stdscr: curses.window) -> None:
+        name_input = LineInput(stdscr, "New secret name", "")
+        key = name_input.capture().strip()
+        if not key:
+            return
+        if not key.endswith("/"):
+            payload_editor = MultiLineEditor(stdscr, "Secret JSON", "{\n  \"key\": \"value\"\n}")
+            raw = payload_editor.capture()
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    raise ValueError("Secret must be a JSON object")
+                self.vault.write_secret(self.current_path + key, data)
+                self.log(f"Wrote {self.current_path + key}", "ok")
+                self.refresh_listing()
+            except Exception as exc:  # noqa: BLE001
+                self.log(f"Write failed: {exc}", "err")
+
+    def edit_secret(self, stdscr: curses.window) -> None:
+        if not self.items:
+            return
+        item = self.items[self.selected]
+        if item.endswith("/"):
+            return
+        full_path = self.current_path + item
+        try:
+            secret = self.vault.read_secret(full_path)
+            current_data = secret.get("data", {})
+        except Exception as exc:  # noqa: BLE001
+            self.log(str(exc), "err")
+            return
+        editor = MultiLineEditor(stdscr, f"Edit {item}", json.dumps(current_data, indent=2))
+        raw = editor.capture()
+        try:
+            new_data = json.loads(raw)
+            if not isinstance(new_data, dict):
+                raise ValueError("Secret must be a JSON object")
+            self.vault.write_secret(full_path, new_data)
+            self.log(f"Updated {full_path}", "ok")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"Update failed: {exc}", "err")
 
     def delete_secret(self, stdscr: curses.window) -> None:
-        path = TextInput(stdscr, "Delete path", "").capture()
-        choice = TextInput(stdscr, "Type 'soft' or 'destroy'", "soft").capture()
+        if not self.items:
+            return
+        item = self.items[self.selected]
+        if item.endswith("/"):
+            return
+        confirm = LineInput(stdscr, "Type DELETE to confirm", "")
+        text = confirm.capture()
+        if text.strip().upper() != "DELETE":
+            return
         try:
-            if choice.lower().startswith("soft"):
-                self.client.secrets.kv.v2.delete_latest_version_of_secret(
-                    path=path, mount_point=self.mount_point
-                )
-                self.log(f"Soft-deleted latest version of {path}")
-            elif choice.lower().startswith("destroy"):
-                self.client.secrets.kv.v2.delete_metadata_and_all_versions(
-                    path=path, mount_point=self.mount_point
-                )
-                self.log(f"Destroyed all versions of {path}")
-            else:
-                self.log("Delete cancelled (type soft/destroy)")
+            self.vault.delete_secret(self.current_path + item)
+            self.log(f"Deleted {self.current_path + item}", "ok")
+            self.refresh_listing()
         except Exception as exc:  # noqa: BLE001
-            self.log(f"Delete error: {exc}")
-
-    def change_mount(self, stdscr: curses.window) -> None:
-        mount = TextInput(stdscr, "New KV v2 mount", self.mount_point).capture()
-        if mount:
-            self.mount_point = mount
-            self.log(f"Switched mount to {mount}")
-
-    def display_output(self, stdscr: curses.window, title: str, body: str) -> None:
-        max_y, max_x = stdscr.getmaxyx()
-        height = min(max_y - 4, max(6, body.count("\n") + 4))
-        width = max_x - 4
-        start_y = 2
-        start_x = 2
-        win = curses.newwin(height, width, start_y, start_x)
-        win.border()
-        win.addstr(0, 2, f" {title} ")
-        for idx, line in enumerate(body.splitlines()):
-            if idx >= height - 2:
-                break
-            win.addstr(1 + idx, 2, line[: width - 4])
-        win.addstr(height - 2, 2, "Press any key to continue")
-        win.refresh()
-        win.getch()
-
-    def run(self, stdscr: curses.window) -> None:
-        self.init_colors()
-        curses.curs_set(0)
-        stdscr.nodelay(False)
-        if curses.has_colors():
-            stdscr.bkgd(" ", curses.color_pair(0))
-        try:
-            self.login_screen(stdscr)
-            self.dashboard(stdscr)
-        except KeyboardInterrupt:
-            self.log("Exiting...")
+            self.log(f"Delete failed: {exc}", "err")
 
 
 def main() -> None:
-    app = NvimvtApp()
+    app = TuiApp()
     curses.wrapper(app.run)
 
 
