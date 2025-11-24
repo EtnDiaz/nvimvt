@@ -1,11 +1,11 @@
 # nvimvt
 
-A minimal terminal UI for HashiCorp Vault secrets. It focuses on developers who can port-forward to Vault but cannot reach it via TailScale.
+A curses-based terminal UI for HashiCorp Vault secrets. It focuses on developers who can port-forward to Vault but cannot reach it via TailScale.
 
 ## Features
 - Login with a Vault token or username/password against a chosen Vault address.
 - Work with KV v2 secrets: list keys, read a version, create or update (new version), and delete versions or entire metadata.
-- Text prompts keep interaction simple even over remote shells.
+- Full-screen TUI with a login form and hotkeys for each secret action.
 
 ## Requirements
 - Python 3.10+
@@ -15,7 +15,15 @@ A minimal terminal UI for HashiCorp Vault secrets. It focuses on developers who 
 ## Usage
 1. Install dependencies: `pip install -r requirements.txt`.
 2. Run the TUI: `python nvimvt.py`.
-3. Follow the prompts to set `VAULT_ADDR`, choose auth (token or userpass), and interact with secrets.
+3. Use **Tab/Shift+Tab** and **Enter** on the login form to edit fields; press **F5** to connect.
+4. In the dashboard press hotkeys to manage secrets:
+   - `L` list a path
+   - `R` read a secret (optionally choose a version)
+   - `W` create/update using multi-line `key=value` pairs
+   - `D` delete (soft delete or destroy all versions)
+   - `M` change the KV v2 mount point
+   - `G` reopen the login form and re-authenticate
+   - `Q` quit
 
 ### Secret operations
 - **List**: shows keys and folders for a relative path under the mount.
