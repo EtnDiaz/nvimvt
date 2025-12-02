@@ -1,0 +1,8 @@
+address: http://127.0.0.1:8200
+mount_point: secret
+auth_method: token
+token: s.xxxxxx
+# username: dev
+# password: example
+k8s_token_path: /var/run/secrets/kubernetes.io/serviceaccount/token
+k8s_role: default
